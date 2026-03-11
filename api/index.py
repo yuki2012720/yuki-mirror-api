@@ -79,62 +79,46 @@ def mirror():
 
 # Vercel 要求的导出
 app = app
-@app.route('/shuffle', methods=['POST'])
-def pixel_shuffle():
-    if 'image' not in request.files:
-        return "No image uploaded", 400
+@app.route('/melt', methods=['POST'])
+def pixel_sort_melt():
+    if 'image' not in request.files: return "No file", 400
     
     file = request.files['image']
     img = Image.open(file)
     
-    # 块大小：越小越碎，越鬼畜
-    block_size = int(request.form.get('block_size', 20))
-    block_size = max(5, min(200, block_size)) # 限制范围防止崩溃
+    # 阈值：决定哪些像素会被“融化”，0-255
+    threshold = int(request.form.get('threshold', 100))
     
     frames = []
     durations = []
     
-    # 获取 GIF 的每一帧
     for frame in ImageSequence.Iterator(img):
         f = frame.convert("RGBA")
-        w, h = f.size
+        data = np.array(f)
         
-        # 计算可以切分多少块
-        nx, ny = w // block_size, h // block_size
-        if nx == 0 or ny == 0:
-            return "Block size too large for this image", 400
+        # 提取亮度 (简单灰度化处理)
+        brightness = np.sum(data[:, :, :3], axis=2) / 3
+        
+        # 核心算法：对每一行进行条件排序
+        for y in range(data.shape[0]):
+            row = data[y, :, :]
+            b_row = brightness[y, :]
             
-        # 1. 采集所有的像素块
-        blocks = []
-        for j in range(ny):
-            for i in range(nx):
-                box = (i * block_size, j * block_size, (i + 1) * block_size, (j + 1) * block_size)
-                blocks.append(f.crop(box))
+            # 找到亮度超过阈值的区间进行排序
+            mask = b_row > threshold
+            if np.any(mask):
+                # 找出连续的 True 区间并排序（这里简化为全行排序增加鬼畜感）
+                indices = np.where(mask)[0]
+                if len(indices) > 1:
+                    start, end = indices[0], indices[-1]
+                    # 按亮度排序该行像素
+                    sort_idx = np.argsort(b_row[start:end])
+                    data[y, start:end, :] = data[y, start:end, :][sort_idx]
         
-        # 2. 暴力洗牌（每一帧都乱序，产生闪烁感）
-        random.shuffle(blocks)
-        
-        # 3. 重新拼装回新画布
-        new_f = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        idx = 0
-        for j in range(ny):
-            for i in range(nx):
-                new_f.paste(blocks[idx], (i * block_size, j * block_size))
-                idx += 1
-        
-        frames.append(new_f)
+        frames.append(Image.fromarray(data))
         durations.append(frame.info.get('duration', 100))
 
     output = io.BytesIO()
-    # 保存为 GIF
-    frames[0].save(
-        output, 
-        format='GIF', 
-        save_all=True, 
-        append_images=frames[1:], 
-        loop=0, 
-        duration=durations,
-        disposal=2
-    )
+    frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:], loop=0, duration=durations, disposal=2)
     output.seek(0)
     return send_file(output, mimetype='image/gif')
