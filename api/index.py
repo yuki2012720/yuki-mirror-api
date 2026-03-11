@@ -4,6 +4,7 @@ from PIL import Image, ImageOps, ImageSequence
 import io
 import math
 import numpy as np
+import random
 
 app = Flask(__name__)
 CORS(app)
@@ -78,57 +79,62 @@ def mirror():
 
 # Vercel 要求的导出
 app = app
-@app.route('/slitscan', methods=['POST'])
-def slitscan():
+@app.route('/shuffle', methods=['POST'])
+def pixel_shuffle():
     if 'image' not in request.files:
         return "No image uploaded", 400
     
     file = request.files['image']
-    try:
-        img = Image.open(file)
-    except IOError:
-         return "Invalid image file", 400
-
-    if not getattr(img, "is_animated", False):
-        return "Image must be a GIF", 400
-
-    # 获取参数：错位程度 (1-100)，默认 10
-    intensity = int(request.form.get('intensity', 10))
-    intensity = max(1, min(100, intensity)) # 限制范围
-
+    img = Image.open(file)
+    
+    # 块大小：越小越碎，越鬼畜
+    block_size = int(request.form.get('block_size', 20))
+    block_size = max(5, min(200, block_size)) # 限制范围防止崩溃
+    
     frames = []
     durations = []
+    
+    # 获取 GIF 的每一帧
     for frame in ImageSequence.Iterator(img):
-        frames.append(frame.convert("RGBA"))
+        f = frame.convert("RGBA")
+        w, h = f.size
+        
+        # 计算可以切分多少块
+        nx, ny = w // block_size, h // block_size
+        if nx == 0 or ny == 0:
+            return "Block size too large for this image", 400
+            
+        # 1. 采集所有的像素块
+        blocks = []
+        for j in range(ny):
+            for i in range(nx):
+                box = (i * block_size, j * block_size, (i + 1) * block_size, (j + 1) * block_size)
+                blocks.append(f.crop(box))
+        
+        # 2. 暴力洗牌（每一帧都乱序，产生闪烁感）
+        random.shuffle(blocks)
+        
+        # 3. 重新拼装回新画布
+        new_f = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        idx = 0
+        for j in range(ny):
+            for i in range(nx):
+                new_f.paste(blocks[idx], (i * block_size, j * block_size))
+                idx += 1
+        
+        frames.append(new_f)
         durations.append(frame.info.get('duration', 100))
-    
-    num_frames = len(frames)
-    w, h = frames[0].size
-    
-    # 将所有帧转换为 numpy 数组
-    frames_np = [np.array(f) for f in frames]
-    
-    new_frames = []
-    for i in range(num_frames):
-        new_img_np = np.zeros_like(frames_np[0])
-        for y in range(h):
-            # 核心逻辑：每一行的时间偏移量
-            # 偏移量随行号 y 和强度 intensity 变化
-            offset = int((y / h) * intensity * (num_frames - 1))
-            frame_idx = (i + offset) % num_frames
-            new_img_np[y, :, :] = frames_np[frame_idx][y, :, :]
-        
-        new_frames.append(Image.fromarray(new_img_np, 'RGBA'))
-        
+
     output = io.BytesIO()
-    new_frames[0].save(
+    # 保存为 GIF
+    frames[0].save(
         output, 
         format='GIF', 
         save_all=True, 
-        append_images=new_frames[1:], 
+        append_images=frames[1:], 
         loop=0, 
         duration=durations,
-        disposal=2 
+        disposal=2
     )
     output.seek(0)
     return send_file(output, mimetype='image/gif')
