@@ -3,6 +3,7 @@ from flask_cors import CORS
 from PIL import Image, ImageOps, ImageSequence
 import io
 import math
+import numpy as np
 
 app = Flask(__name__)
 CORS(app)
@@ -77,3 +78,57 @@ def mirror():
 
 # Vercel 要求的导出
 app = app
+@app.route('/slitscan', methods=['POST'])
+def slitscan():
+    if 'image' not in request.files:
+        return "No image uploaded", 400
+    
+    file = request.files['image']
+    try:
+        img = Image.open(file)
+    except IOError:
+         return "Invalid image file", 400
+
+    if not getattr(img, "is_animated", False):
+        return "Image must be a GIF", 400
+
+    # 获取参数：错位程度 (1-100)，默认 10
+    intensity = int(request.form.get('intensity', 10))
+    intensity = max(1, min(100, intensity)) # 限制范围
+
+    frames = []
+    durations = []
+    for frame in ImageSequence.Iterator(img):
+        frames.append(frame.convert("RGBA"))
+        durations.append(frame.info.get('duration', 100))
+    
+    num_frames = len(frames)
+    w, h = frames[0].size
+    
+    # 将所有帧转换为 numpy 数组
+    frames_np = [np.array(f) for f in frames]
+    
+    new_frames = []
+    for i in range(num_frames):
+        new_img_np = np.zeros_like(frames_np[0])
+        for y in range(h):
+            # 核心逻辑：每一行的时间偏移量
+            # 偏移量随行号 y 和强度 intensity 变化
+            offset = int((y / h) * intensity * (num_frames - 1))
+            frame_idx = (i + offset) % num_frames
+            new_img_np[y, :, :] = frames_np[frame_idx][y, :, :]
+        
+        new_frames.append(Image.fromarray(new_img_np, 'RGBA'))
+        
+    output = io.BytesIO()
+    new_frames[0].save(
+        output, 
+        format='GIF', 
+        save_all=True, 
+        append_images=new_frames[1:], 
+        loop=0, 
+        duration=durations,
+        disposal=2 
+    )
+    output.seek(0)
+    return send_file(output, mimetype='image/gif')
