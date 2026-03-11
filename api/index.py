@@ -85,40 +85,56 @@ def pixel_sort_melt():
     
     file = request.files['image']
     img = Image.open(file)
-    
-    # 阈值：决定哪些像素会被“融化”，0-255
     threshold = int(request.form.get('threshold', 100))
     
     frames = []
     durations = []
     
-    for frame in ImageSequence.Iterator(img):
+    # --- 加速策略 1：帧数控制 ---
+    all_frames = list(ImageSequence.Iterator(img))
+    # 如果帧数超过 60 帧，每隔一帧取一次，防止 Vercel 超时
+    step = 1 if len(all_frames) < 60 else 2 
+    
+    for i in range(0, len(all_frames), step):
+        frame = all_frames[i]
+        # --- 加速策略 2：缩小尺寸处理 ---
+        # 如果图太大，强制缩小到 400px 宽，处理完再拉伸（这种“锯齿感”更鬼畜）
+        original_size = frame.size
+        if original_size[0] > 400:
+            frame = frame.resize((400, int(400 * original_size[1] / original_size[0])), Image.NEAREST)
+        
         f = frame.convert("RGBA")
         data = np.array(f)
         
-        # 提取亮度 (简单灰度化处理)
-        brightness = np.sum(data[:, :, :3], axis=2) / 3
-        
-        # 核心算法：对每一行进行条件排序
+        # 简化算法：直接对亮度达标的行进行快速切片排序
+        brightness = np.mean(data[:, :, :3], axis=2)
         for y in range(data.shape[0]):
-            row = data[y, :, :]
-            b_row = brightness[y, :]
-            
-            # 找到亮度超过阈值的区间进行排序
-            mask = b_row > threshold
+            mask = brightness[y, :] > threshold
             if np.any(mask):
-                # 找出连续的 True 区间并排序（这里简化为全行排序增加鬼畜感）
-                indices = np.where(mask)[0]
-                if len(indices) > 1:
-                    start, end = indices[0], indices[-1]
-                    # 按亮度排序该行像素
-                    sort_idx = np.argsort(b_row[start:end])
-                    data[y, start:end, :] = data[y, start:end, :][sort_idx]
+                # 仅对这一行中“亮”的部分进行排序
+                row_pixels = data[y, mask, :]
+                # 按红色通道排序（比按计算出来的亮度排快得多）
+                sort_idx = np.argsort(row_pixels[:, 0])
+                data[y, mask, :] = row_pixels[sort_idx]
         
-        frames.append(Image.fromarray(data))
-        durations.append(frame.info.get('duration', 100))
+        new_frame = Image.fromarray(data)
+        # 如果之前缩小了，现在拉回原大
+        if original_size[0] > 400:
+            new_frame = new_frame.resize(original_size, Image.NEAREST)
+            
+        frames.append(new_frame)
+        durations.append(img.info.get('duration', 100) * step) # 补偿跳帧的时间
 
     output = io.BytesIO()
-    frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:], loop=0, duration=durations, disposal=2)
+    # --- 加速策略 3：压缩优化 ---
+    frames[0].save(
+        output, 
+        format='GIF', 
+        save_all=True, 
+        append_images=frames[1:], 
+        loop=0, 
+        duration=durations,
+        optimize=True # 开启保存优化
+    )
     output.seek(0)
     return send_file(output, mimetype='image/gif')
