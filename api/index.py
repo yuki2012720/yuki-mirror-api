@@ -87,54 +87,66 @@ def pixel_sort_melt():
     img = Image.open(file)
     threshold = int(request.form.get('threshold', 100))
     
-    frames = []
+    # --- 强力修复：物理提取所有帧 ---
+    all_frames = []
     durations = []
     
-    # --- 加速策略 1：帧数控制 ---
-    all_frames = list(ImageSequence.Iterator(img))
-    # 如果帧数超过 60 帧，每隔一帧取一次，防止 Vercel 超时
-    step = 1 if len(all_frames) < 60 else 2 
-    
-    for i in range(0, len(all_frames), step):
-        frame = all_frames[i]
-        # --- 加速策略 2：缩小尺寸处理 ---
-        # 如果图太大，强制缩小到 400px 宽，处理完再拉伸（这种“锯齿感”更鬼畜）
-        original_size = frame.size
-        if original_size[0] > 400:
-            frame = frame.resize((400, int(400 * original_size[1] / original_size[0])), Image.NEAREST)
-        
-        f = frame.convert("RGBA")
+    # 即使是只有一帧的图，ImageSequence 也能处理
+    for frame in ImageSequence.Iterator(img):
+        # 使用 .copy() 彻底断绝与原图的引用关系，防止“粘连”
+        all_frames.append(frame.copy().convert("RGBA"))
+        durations.append(frame.info.get('duration', 100))
+
+    if len(all_frames) <= 1:
+        # 如果真的不是动图，直接处理单张返回
+        processed_data = process_single_frame(all_frames[0], threshold)
+        output = io.BytesIO()
+        processed_data.save(output, format='PNG')
+        output.seek(0)
+        return send_file(output, mimetype='image/png')
+
+    # --- 开始逐帧“手术” ---
+    processed_frames = []
+    # 限制总帧数，防止 Vercel 炸掉 (选前 60 帧)
+    for f in all_frames[:60]:
         data = np.array(f)
-        
-        # 简化算法：直接对亮度达标的行进行快速切片排序
+        # 简化版排序：速度飞快且稳定
         brightness = np.mean(data[:, :, :3], axis=2)
         for y in range(data.shape[0]):
             mask = brightness[y, :] > threshold
             if np.any(mask):
-                # 仅对这一行中“亮”的部分进行排序
                 row_pixels = data[y, mask, :]
-                # 按红色通道排序（比按计算出来的亮度排快得多）
+                # 按红色通道排序，产生那种诡异的熔化感
                 sort_idx = np.argsort(row_pixels[:, 0])
                 data[y, mask, :] = row_pixels[sort_idx]
         
-        new_frame = Image.fromarray(data)
-        # 如果之前缩小了，现在拉回原大
-        if original_size[0] > 400:
-            new_frame = new_frame.resize(original_size, Image.NEAREST)
-            
-        frames.append(new_frame)
-        durations.append(img.info.get('duration', 100) * step) # 补偿跳帧的时间
+        processed_frames.append(Image.fromarray(data))
 
+    # --- 重新打包，确保 metadata 完整 ---
     output = io.BytesIO()
-    # --- 加速策略 3：压缩优化 ---
-    frames[0].save(
+    processed_frames[0].save(
         output, 
         format='GIF', 
         save_all=True, 
-        append_images=frames[1:], 
-        loop=0, 
-        duration=durations,
-        optimize=True # 开启保存优化
+        append_images=processed_frames[1:], 
+        loop=0,               # 确保循环播放
+        duration=durations[:60], # 保持原有的帧间隔
+        disposal=2,           # 每一帧都清理上一帧，防止重影
+        optimize=False        # 递归处理时关闭 optimize 有时更稳
     )
+    output.seek(0)
+    return send_file(output, mimetype='image/gif')
+
+# 辅助函数，处理非 GIF 情况
+def process_single_frame(f, threshold):
+    data = np.array(f)
+    brightness = np.mean(data[:, :, :3], axis=2)
+    for y in range(data.shape[0]):
+        mask = brightness[y, :] > threshold
+        if np.any(mask):
+            row_pixels = data[y, mask, :]
+            sort_idx = np.argsort(row_pixels[:, 0])
+            data[y, mask, :] = row_pixels[sort_idx]
+    return Image.fromarray(data)
     output.seek(0)
     return send_file(output, mimetype='image/gif')
